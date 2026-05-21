@@ -16,7 +16,7 @@ It is intentionally small:
 
 ```bash
 git clone <this-repo-url>
-cd simple-agentflow
+cd agentflow
 cargo install --path . --locked
 ```
 
@@ -77,8 +77,7 @@ prompts:
       If you need my input before safely continuing, call:
       {{notify_command}}
 
-      If {{item_id}} is already complete and there is nothing to do, call:
-      {{halt_command}}
+      If {{item_id}} is already complete, say so and finish this step without calling halt.
 
   - id: review-plan
     text: |

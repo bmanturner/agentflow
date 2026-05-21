@@ -77,8 +77,7 @@ prompts:
       If you need my input before safely continuing, call:
       {{notify_command}}
 
-      If {{item_id}} is already complete and there is nothing to do, call:
-      {{halt_command}}
+      If {{item_id}} is already complete, say so and finish this step without calling halt.
 
   - id: review-plan
     text: |
@@ -87,8 +86,7 @@ prompts:
       If you need my input before safely continuing, call:
       {{notify_command}}
 
-      If there is nothing left to do, call:
-      {{halt_command}}
+      If there is nothing left to do for this step, say so and finish without calling halt.
 
   - id: summarize-open-questions
     pause_after: true
@@ -104,8 +102,7 @@ prompts:
       If you need my input or hit a blocker, call:
       {{notify_command}}
 
-      If this is already implemented and verified, call:
-      {{halt_command}}
+      If this is already implemented and verified, say so and finish this step without calling halt.
 
   - id: review-and-fix
     text: |
@@ -114,8 +111,7 @@ prompts:
       If you need my input or hit a blocker, call:
       {{notify_command}}
 
-      If there is nothing left to review or fix, call:
-      {{halt_command}}
+      If there is nothing left to review or fix, say so and finish this step without calling halt.
 ```
 
 ### Config validation

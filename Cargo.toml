@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Tiny local loop runner for OMP sessions"
 readme = "README.md"
+license = "MIT"
 
 [dependencies]
 anyhow = "1"

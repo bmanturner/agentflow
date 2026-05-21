@@ -42,11 +42,6 @@ agentflow smoke-test
 - OMP configured for normal interactive use.
 - A project-local `.agentflow.yml`.
 
-Optional, if your config uses Prowl notifications:
-
-```bash
-export PROWL_API_KEY="your-40-byte-prowl-api-key"
-```
 
 ## Quick start
 
@@ -147,52 +142,27 @@ agentflow halt --message "M14 is already complete. No further work needed."
 
 AgentFlow waits for the current OMP turn to reach `agent_end`, records the halt, and does not advance to the next prompt or counter value.
 
-## Prowl notification example
+## HTTP notification example
 
 AgentFlow runs `notify.command` directly as argv. It is not a shell string.
 
-This example posts to Prowl's REST API using Python's standard library and priority `1`:
+This example posts a simple form-encoded notification with `curl`:
 
 ```yaml
 notify:
   command:
-    - python3
-    - -c
-    - |
-      import os
-      import sys
-      import urllib.parse
-      import urllib.request
-
-      api_key = os.environ.get("PROWL_API_KEY")
-      if not api_key:
-          sys.stderr.write("PROWL_API_KEY is not set\n")
-          raise SystemExit(2)
-
-      message = sys.argv[1]
-      item_id = sys.argv[2] if len(sys.argv) > 2 else "AgentFlow"
-      data = urllib.parse.urlencode({
-          "apikey": api_key,
-          "application": "AgentFlow",
-          "event": "Review needed for " + item_id,
-          "description": message,
-          "priority": "1",
-      }).encode("utf-8")
-
-      request = urllib.request.Request(
-          "https://api.prowlapp.com/publicapi/add",
-          data=data,
-          method="POST",
-      )
-      try:
-          with urllib.request.urlopen(request, timeout=15) as response:
-              response.read()
-      except Exception as exc:
-          sys.stderr.write("Prowl notification failed: " + str(exc) + "\n")
-          raise SystemExit(1)
-    - "{{message}}"
-    - "{{item_id}}"
+    - curl
+    - -fsS
+    - -X
+    - POST
+    - https://example.com/agentflow-notify
+    - --data-urlencode
+    - "message={{message}}"
+    - --data-urlencode
+    - "item_id={{item_id}}"
 ```
+
+Replace `https://example.com/agentflow-notify` with your own webhook endpoint.
 
 ## Template variables
 

@@ -1,6 +1,6 @@
 # AgentFlow
 
-AgentFlow is a tiny local loop runner for [OMP](https://github.com/oh-my-pi/omp) sessions. It reads one `.agentflow.yml`, renders inline prompt templates, sends prompts to `omp --mode rpc` in order, and lets the agent pause or halt the flow from inside the OMP turn.
+AgentFlow is a tiny local loop runner for [omp](https://omp.sh) sessions. It reads one `.agentflow.yml`, renders inline prompt templates, sends prompts to `omp --mode rpc` in order, and lets the agent pause or halt the flow from inside the omp turn.
 
 It is intentionally small:
 

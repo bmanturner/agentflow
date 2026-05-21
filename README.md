@@ -58,7 +58,16 @@ loop:
   item_id: "M{{counter}}"
 
 notify:
-  command: null
+  command:
+    - curl
+    - -fsS
+    - -X
+    - POST
+    - https://example.com/agentflow-notify
+    - --data-urlencode
+    - "message={{message}}"
+    - --data-urlencode
+    - "item_id={{item_id}}"
 
 prompts:
   - id: plan

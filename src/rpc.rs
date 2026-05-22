@@ -1,3 +1,4 @@
+use std::env;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -12,8 +13,12 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-const READY_TIMEOUT: Duration = Duration::from_secs(30);
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_PROMPT_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
+const READY_TIMEOUT_ENV: &str = "AGENTFLOW_OMP_READY_TIMEOUT_SECONDS";
+const COMMAND_TIMEOUT_ENV: &str = "AGENTFLOW_OMP_COMMAND_TIMEOUT_SECONDS";
+const PROMPT_IDLE_TIMEOUT_ENV: &str = "AGENTFLOW_OMP_PROMPT_IDLE_TIMEOUT_SECONDS";
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const KILL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -29,6 +34,56 @@ pub struct PromptOutcome {
     pub frames: Vec<Value>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RpcTimeouts {
+    ready: Duration,
+    command: Duration,
+    prompt_idle: Duration,
+}
+
+impl RpcTimeouts {
+    fn from_env() -> Result<Self> {
+        Ok(Self {
+            ready: duration_from_env(READY_TIMEOUT_ENV, DEFAULT_READY_TIMEOUT)?,
+            command: duration_from_env(COMMAND_TIMEOUT_ENV, DEFAULT_COMMAND_TIMEOUT)?,
+            prompt_idle: duration_from_env(PROMPT_IDLE_TIMEOUT_ENV, DEFAULT_PROMPT_IDLE_TIMEOUT)?,
+        })
+    }
+
+    const fn get(self, kind: TimeoutKind) -> Duration {
+        match kind {
+            TimeoutKind::Ready => self.ready,
+            TimeoutKind::CommandResponse => self.command,
+            TimeoutKind::PromptIdle => self.prompt_idle,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TimeoutKind {
+    Ready,
+    CommandResponse,
+    PromptIdle,
+}
+
+impl TimeoutKind {
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Ready => "ready frame",
+            Self::CommandResponse => "command response frame",
+            Self::PromptIdle => "prompt progress or completion frame",
+        }
+    }
+
+    const fn env_var(self) -> &'static str {
+        match self {
+            Self::Ready => READY_TIMEOUT_ENV,
+            Self::CommandResponse => COMMAND_TIMEOUT_ENV,
+            Self::PromptIdle => PROMPT_IDLE_TIMEOUT_ENV,
+        }
+    }
+}
+
 pub struct OmpRpc {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -36,6 +91,7 @@ pub struct OmpRpc {
     stdout_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
     stderr: Arc<Mutex<String>>,
+    timeouts: RpcTimeouts,
     next_id: u64,
 }
 
@@ -56,6 +112,8 @@ impl OmpRpc {
         item_id: &str,
         counter: i64,
     ) -> Result<Self> {
+        let timeouts = RpcTimeouts::from_env()?;
+
         let mut command = Command::new(omp);
         command
             .arg("--mode")
@@ -141,10 +199,11 @@ impl OmpRpc {
             stdout_task,
             stderr_task,
             stderr: stderr_buffer,
+            timeouts,
             next_id: 1,
         };
 
-        let ready = rpc.read_frame_with_timeout(READY_TIMEOUT).await?;
+        let ready = rpc.read_frame_with_timeout(TimeoutKind::Ready).await?;
         if frame_type(&ready) != Some("ready") {
             bail!("expected omp ready frame, got {ready}");
         }
@@ -184,7 +243,9 @@ impl OmpRpc {
 
         let (ack, mut frames) = self.wait_for_prompt_ack(&id).await?;
         loop {
-            let frame = self.read_frame_with_timeout(COMMAND_TIMEOUT).await?;
+            let frame = self
+                .read_frame_with_timeout(TimeoutKind::PromptIdle)
+                .await?;
             let is_agent_end = frame_type(&frame) == Some("agent_end");
             frames.push(frame);
             if is_agent_end {
@@ -303,7 +364,9 @@ impl OmpRpc {
     async fn wait_for_command_response(&mut self, id: &str) -> Result<(Value, Vec<Value>)> {
         let mut frames = Vec::new();
         loop {
-            let frame = self.read_frame_with_timeout(COMMAND_TIMEOUT).await?;
+            let frame = self
+                .read_frame_with_timeout(TimeoutKind::CommandResponse)
+                .await?;
             if frame_id(&frame) == Some(id) {
                 ensure_success(&frame)?;
                 return Ok((frame, frames));
@@ -315,7 +378,9 @@ impl OmpRpc {
     async fn wait_for_prompt_ack(&mut self, id: &str) -> Result<(Value, Vec<Value>)> {
         let mut frames = Vec::new();
         loop {
-            let frame = self.read_frame_with_timeout(COMMAND_TIMEOUT).await?;
+            let frame = self
+                .read_frame_with_timeout(TimeoutKind::CommandResponse)
+                .await?;
             if frame_type(&frame) == Some("agent_end") {
                 bail!("agent_end arrived before prompt ack for {id}");
             }
@@ -327,26 +392,61 @@ impl OmpRpc {
         }
     }
 
-    async fn read_frame_with_timeout(&mut self, duration: Duration) -> Result<Value> {
+    async fn read_frame_with_timeout(&mut self, kind: TimeoutKind) -> Result<Value> {
+        let duration = self.timeouts.get(kind);
         match timeout(duration, self.frames.recv()).await {
             Ok(Some(Ok(frame))) => Ok(frame),
             Ok(Some(Err(error))) => bail!("{error}"),
             Ok(None) => {
                 let stderr = self.stderr.lock().await;
                 if stderr.is_empty() {
-                    bail!("omp rpc process closed stdout");
+                    bail!(
+                        "omp rpc process closed stdout while waiting for {}",
+                        kind.description()
+                    );
                 }
-                bail!("omp rpc process closed stdout; stderr: {stderr}");
+                bail!(
+                    "omp rpc process closed stdout while waiting for {}; stderr: {stderr}",
+                    kind.description()
+                );
             }
             Err(_) => {
                 let stderr = self.stderr.lock().await;
+                let seconds = duration.as_secs();
                 if stderr.is_empty() {
-                    bail!("timed out waiting for omp rpc frame");
+                    bail!(
+                        "timed out after {seconds}s waiting for omp rpc {}; set {} to a larger number of seconds if OMP is still working",
+                        kind.description(),
+                        kind.env_var()
+                    );
                 }
-                bail!("timed out waiting for omp rpc frame; stderr: {stderr}");
+                bail!(
+                    "timed out after {seconds}s waiting for omp rpc {}; stderr: {stderr}; set {} to a larger number of seconds if OMP is still working",
+                    kind.description(),
+                    kind.env_var()
+                );
             }
         }
     }
+}
+
+fn duration_from_env(name: &'static str, default: Duration) -> Result<Duration> {
+    match env::var(name) {
+        Ok(value) => parse_timeout_seconds(name, &value),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotUnicode(_)) => bail!("{name} must be valid UTF-8"),
+    }
+}
+
+fn parse_timeout_seconds(name: &str, value: &str) -> Result<Duration> {
+    let seconds = value
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("{name} must be a positive integer number of seconds"))?;
+    if seconds == 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 fn frame_type(frame: &Value) -> Option<&str> {
@@ -441,5 +541,27 @@ mod tests {
         let response = json!({ "id": "req-1", "success": false });
 
         assert!(ensure_success(&response).is_err());
+    }
+
+    #[test]
+    fn parse_timeout_seconds_accepts_positive_integer() -> Result<()> {
+        assert_eq!(parse_timeout_seconds("TEST_TIMEOUT", " 42 ")?.as_secs(), 42);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_timeout_seconds_rejects_zero() {
+        let error = parse_timeout_seconds("TEST_TIMEOUT", "0").unwrap_err();
+
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn parse_timeout_seconds_rejects_non_integer() {
+        let error = parse_timeout_seconds("TEST_TIMEOUT", "five").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("positive integer number of seconds"));
     }
 }

@@ -229,6 +229,28 @@ AgentFlow writes local run state under `.agentflow/` in the target repository:
 
 These files are for visibility and crash recovery. They are not a database.
 
+## Troubleshooting OMP RPC timeouts
+
+If a long OMP turn fails with `timed out waiting for omp rpc frame`, AgentFlow did not receive any RPC stdout frame before its idle timeout. First verify OMP RPC works:
+
+```bash
+agentflow smoke-test
+```
+
+For slow prompts or long tool runs, raise the prompt idle timeout:
+
+```bash
+AGENTFLOW_OMP_PROMPT_IDLE_TIMEOUT_SECONDS=3600 agentflow run
+```
+
+Startup and command-response waits are controlled separately:
+
+```bash
+AGENTFLOW_OMP_READY_TIMEOUT_SECONDS=60 \
+AGENTFLOW_OMP_COMMAND_TIMEOUT_SECONDS=600 \
+agentflow run
+```
+
 ## Development
 
 Run checks:

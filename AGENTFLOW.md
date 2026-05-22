@@ -448,16 +448,17 @@ State machine recommendation:
 - `running`: an OMP turn may be active, or the orchestrator is between prompts.
 - `paused`: no OMP RPC process is owned by AgentFlow; `agentflow open` and `agentflow resume` are allowed.
 - `halted`: the agent requested a deliberate stop; no further prompts or counter increments are allowed.
-- `failed`: an infrastructure/config/RPC error stopped the flow; no further prompts or counter increments are allowed.
+- `failed`: an infrastructure/config/RPC error stopped the flow; `agentflow resume` may retry from the recorded prompt when a session file was saved in state or item session records.
 - `completed`: every configured counter item and prompt completed.
 
 Failure behavior recommendation:
 
 - Invalid config fails before starting OMP.
-- Failed prompt ack fails the run.
+- Failed prompt ack fails the run, except a busy-agent rejection is retried until the prompt idle timeout expires.
 - OMP process exit before expected `agent_end` fails the run.
 - Malformed JSON from OMP fails the run.
 - Timeout waiting for `agent_end` fails the run unless the user explicitly resumes/retries in a later command.
+- A failed RPC response with `Agent is already processing` is recoverable: preserve intervening frames, back off, and retry the same command with a fresh id for internally generated commands.
 - Failed state write fails the run before sending the next prompt.
 - Failed external `notify.command` should be recorded in `last_error` but should not prevent pausing or halting.
 

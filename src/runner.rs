@@ -97,17 +97,8 @@ async fn resume_command(
     message: Option<String>,
 ) -> Result<()> {
     let state = require_state(&paths.state_path).await?;
-    if state.status != RunStatus::Paused {
-        bail!(
-            "cannot resume run with status {:?}; only paused runs can resume",
-            state.status
-        );
-    }
-    let session_file = state
-        .current
-        .session_file
-        .clone()
-        .ok_or_else(|| anyhow!("paused state is missing current.session_file"))?;
+    ensure_resumable_status(state.status)?;
+    let session_file = resume_session_file(paths, &state.current).await?;
     let mut config = load_and_validate_config(config_path, repo_root, RunArgs::default()).await?;
     let plan = build_loop_plan(&config, repo_root)?;
     let (item_index, prompt_index) = find_resume_position(&plan, &state.current)?;
@@ -200,6 +191,52 @@ async fn control_command(kind: ControlKind, message: String) -> Result<()> {
     send_control_event(Path::new(&socket), &event).await?;
     println!("{message}");
     Ok(())
+}
+
+fn ensure_resumable_status(status: RunStatus) -> Result<()> {
+    if matches!(status, RunStatus::Paused | RunStatus::Failed) {
+        return Ok(());
+    }
+    bail!("cannot resume run with status {status:?}; only paused or failed runs can resume")
+}
+
+async fn resume_session_file(paths: &AgentFlowPaths, current: &CurrentState) -> Result<PathBuf> {
+    if let Some(session_file) = current.session_file.as_ref() {
+        return Ok(session_file.clone());
+    }
+
+    latest_recorded_session_file(paths, &current.item_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "resumable state is missing current.session_file and no recorded session exists for {}",
+                current.item_id
+            )
+        })
+}
+
+async fn latest_recorded_session_file(
+    paths: &AgentFlowPaths,
+    item_id: &str,
+) -> Result<Option<PathBuf>> {
+    let path = paths.sessions_path(item_id);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read sessions file {}", path.display()))
+        }
+    };
+    let records = serde_json::from_slice::<Vec<Value>>(&bytes)
+        .with_context(|| format!("failed to parse sessions file {}", path.display()))?;
+
+    Ok(records
+        .iter()
+        .rev()
+        .filter_map(|record| record.get("session_file").and_then(Value::as_str))
+        .find(|session_file| !session_file.is_empty())
+        .map(PathBuf::from))
 }
 
 async fn refuse_conflicting_state(state_path: &Path) -> Result<()> {
@@ -802,7 +839,23 @@ fn completed_state(request: &DriveRequest<'_>, item: &LoopItem) -> State {
 }
 
 async fn persist_failure(request: &DriveRequest<'_>, item: &LoopItem, error: &str) -> Result<()> {
-    let current = current_state(item, request.start_prompt_index, request.config, None);
+    let previous = load_state(&request.paths.state_path).await?;
+    let current = previous
+        .as_ref()
+        .filter(|state| state.run_id == request.run_id)
+        .map(|state| CurrentState {
+            counter: state.current.counter,
+            item_id: state.current.item_id.clone(),
+            iteration: state.current.iteration,
+            prompt_index: state.current.prompt_index,
+            prompt_id: state.current.prompt_id.clone(),
+            session_id: state.current.session_id.clone(),
+            session_file: state.current.session_file.clone(),
+        })
+        .unwrap_or_else(|| current_state(item, request.start_prompt_index, request.config, None));
+    let pending_control = previous
+        .filter(|state| state.run_id == request.run_id)
+        .and_then(|state| state.pending_control);
     let state = State {
         schema_version: 1,
         run_id: request.run_id.clone(),
@@ -810,7 +863,7 @@ async fn persist_failure(request: &DriveRequest<'_>, item: &LoopItem, error: &st
         repo_root: request.repo_root.to_path_buf(),
         config_path: request.config_path.to_path_buf(),
         current,
-        pending_control: None,
+        pending_control,
         last_error: Some(error.to_owned()),
     };
     save_state(&request.paths.state_path, &state).await
@@ -1026,6 +1079,53 @@ mod tests {
     }
 
     #[test]
+    fn ensure_resumable_status_should_accept_paused_and_failed() -> Result<()> {
+        ensure_resumable_status(RunStatus::Paused)?;
+        ensure_resumable_status(RunStatus::Failed)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_resumable_status_should_reject_terminal_and_running_states() {
+        assert!(ensure_resumable_status(RunStatus::Running).is_err());
+        assert!(ensure_resumable_status(RunStatus::Halted).is_err());
+        assert!(ensure_resumable_status(RunStatus::Completed).is_err());
+    }
+
+    #[tokio::test]
+    async fn resume_session_file_should_fall_back_to_latest_session_record() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let paths = AgentFlowPaths::new(tempdir.path().to_path_buf(), None);
+        let sessions_path = paths.sessions_path("M1");
+        if let Some(parent) = sessions_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(
+            &sessions_path,
+            serde_json::to_vec(&vec![
+                serde_json::json!({ "session_file": "/tmp/old-session.jsonl" }),
+                serde_json::json!({ "session_file": "/tmp/latest-session.jsonl" }),
+            ])?,
+        )
+        .await?;
+        let current = CurrentState {
+            counter: 1,
+            item_id: "M1".to_owned(),
+            iteration: 1,
+            prompt_index: 0,
+            prompt_id: "plan".to_owned(),
+            session_id: None,
+            session_file: None,
+        };
+
+        let session_file = resume_session_file(&paths, &current).await?;
+
+        assert_eq!(session_file, PathBuf::from("/tmp/latest-session.jsonl"));
+        Ok(())
+    }
+
+    #[test]
     fn find_resume_position_should_accept_complete_prompt_index() {
         let plan = test_plan();
         let current = CurrentState {
@@ -1040,6 +1140,61 @@ mod tests {
 
         let position = find_resume_position(&plan, &current).expect("position should resolve");
         assert_eq!(position, (1, 2));
+    }
+
+    #[tokio::test]
+    async fn persist_failure_should_preserve_saved_resume_position() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let repo_root = tempdir.path().to_path_buf();
+        let config_path = repo_root.join(".agentflow.yml");
+        let paths = AgentFlowPaths::new(repo_root.clone(), None);
+        let mut config = test_config();
+        let plan = test_plan();
+        let session_file = PathBuf::from("/tmp/recover-session.jsonl");
+        let state = State {
+            schema_version: 1,
+            run_id: "run-1".to_owned(),
+            status: RunStatus::Running,
+            repo_root: repo_root.clone(),
+            config_path: config_path.clone(),
+            current: CurrentState {
+                counter: 2,
+                item_id: "M2".to_owned(),
+                iteration: 2,
+                prompt_index: 1,
+                prompt_id: "implement".to_owned(),
+                session_id: Some("session-2".to_owned()),
+                session_file: Some(session_file.clone()),
+            },
+            pending_control: None,
+            last_error: None,
+        };
+        save_state(&paths.state_path, &state).await?;
+        let request = DriveRequest {
+            omp: "omp",
+            repo_root: &repo_root,
+            config_path: &config_path,
+            paths: &paths,
+            config: &mut config,
+            plan: &plan,
+            run_id: "run-1".to_owned(),
+            start_item_index: 0,
+            start_prompt_index: 0,
+            resume_session: None,
+            resume_message: None,
+        };
+
+        persist_failure(&request, &plan.items[0], "rpc timeout").await?;
+        let failed = load_state(&paths.state_path)
+            .await?
+            .expect("state should exist");
+
+        assert_eq!(failed.status, RunStatus::Failed);
+        assert_eq!(failed.current.item_id, "M2");
+        assert_eq!(failed.current.prompt_index, 1);
+        assert_eq!(failed.current.session_file, Some(session_file));
+        assert_eq!(failed.last_error.as_deref(), Some("rpc timeout"));
+        Ok(())
     }
 
     #[test]

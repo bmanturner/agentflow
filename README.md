@@ -128,7 +128,7 @@ agentflow open
 
 `agentflow open` resumes the exact OMP session interactively with `omp --resume <sessionFile>`. Answer questions, ask the agent to revise files, then exit OMP with `/exit`.
 
-Continue the configured flow:
+Continue a paused or failed configured flow:
 
 ```bash
 agentflow resume
@@ -140,6 +140,8 @@ Optionally send one more message before continuing:
 agentflow resume "Use these answers to revise the plan, remove resolved questions, and continue: ..."
 ```
 
+If a run fails after AgentFlow has recorded the active OMP session, `agentflow resume` restarts RPC with that saved session and retries from the recorded prompt. If an older failed state is missing `current.session_file`, AgentFlow falls back to the latest recorded session for the item. The previous error remains visible in `agentflow status` until the resumed run writes running state.
+
 ## Halt behavior
 
 The agent can stop the whole flow when continuing would be wrong or unnecessary:
@@ -149,6 +151,7 @@ agentflow halt --message "M14 is already complete. No further work needed."
 ```
 
 AgentFlow waits for the current OMP turn to reach `agent_end`, records the halt, and does not advance to the next prompt or counter value.
+
 
 ## HTTP notification example
 
@@ -236,6 +239,8 @@ If a long OMP turn fails with `timed out waiting for omp rpc frame`, AgentFlow d
 ```bash
 agentflow smoke-test
 ```
+
+When OMP rejects a command with `Agent is already processing`, AgentFlow preserves intervening frames, backs off, and retries the same command until the prompt idle timeout expires.
 
 For slow prompts or long tool runs, raise the prompt idle timeout:
 

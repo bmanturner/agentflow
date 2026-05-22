@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
@@ -21,6 +21,8 @@ const COMMAND_TIMEOUT_ENV: &str = "AGENTFLOW_OMP_COMMAND_TIMEOUT_SECONDS";
 const PROMPT_IDLE_TIMEOUT_ENV: &str = "AGENTFLOW_OMP_PROMPT_IDLE_TIMEOUT_SECONDS";
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const KILL_TIMEOUT: Duration = Duration::from_secs(5);
+const RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
@@ -32,6 +34,11 @@ pub struct SessionInfo {
 pub struct PromptOutcome {
     pub ack: Value,
     pub frames: Vec<Value>,
+}
+
+enum RpcResponse {
+    Success { response: Value, frames: Vec<Value> },
+    RetryableBusy { response: Value, frames: Vec<Value> },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -212,36 +219,95 @@ impl OmpRpc {
     }
 
     pub async fn command(&mut self, mut command: Value) -> Result<(Value, Vec<Value>)> {
-        let object = command
-            .as_object_mut()
-            .context("rpc command must be a JSON object")?;
-        let id = match object.get("id").and_then(Value::as_str) {
-            Some(id) if !id.is_empty() => id.to_owned(),
-            _ => {
-                let command_name = object
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("command");
-                let id = self.next_request_id(command_name);
-                object.insert("id".to_owned(), Value::String(id.clone()));
-                id
-            }
+        let (command_name, caller_supplied_id) = {
+            let object = command
+                .as_object_mut()
+                .context("rpc command must be a JSON object")?;
+            let command_name = object
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("command")
+                .to_owned();
+            let caller_supplied_id = object
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty());
+            (command_name, caller_supplied_id)
         };
+        let mut collected_frames = Vec::new();
+        let retry_deadline = retry_deadline(self.timeouts.prompt_idle);
+        let mut retry_count = 0_usize;
 
-        self.write_frame(&command).await?;
-        self.wait_for_command_response(&id).await
+        loop {
+            let id = {
+                let object = command
+                    .as_object_mut()
+                    .context("rpc command must be a JSON object")?;
+                if caller_supplied_id {
+                    object
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .context("rpc command id must be a string")?
+                        .to_owned()
+                } else {
+                    let id = self.next_request_id(&command_name);
+                    object.insert("id".to_owned(), Value::String(id.clone()));
+                    id
+                }
+            };
+
+            self.write_frame(&command).await?;
+            match self.wait_for_command_response(&id).await? {
+                RpcResponse::Success { response, frames } => {
+                    collected_frames.extend(frames);
+                    return Ok((response, collected_frames));
+                }
+                RpcResponse::RetryableBusy { response, frames } => {
+                    collected_frames.extend(frames);
+                    collected_frames.push(response);
+                    self.wait_before_retry(retry_deadline, retry_count, &mut collected_frames)
+                        .await?;
+                    retry_count = retry_count.saturating_add(1);
+                }
+            }
+        }
     }
 
     pub async fn prompt_and_wait(&mut self, rendered: &str) -> Result<PromptOutcome> {
-        let id = self.next_request_id("prompt");
-        let command = json!({
-            "type": "prompt",
-            "id": id,
-            "message": rendered,
-        });
-        self.write_frame(&command).await?;
+        let mut frames = Vec::new();
+        let retry_deadline = retry_deadline(self.timeouts.prompt_idle);
+        let mut retry_count = 0_usize;
 
-        let (ack, mut frames) = self.wait_for_prompt_ack(&id).await?;
+        let ack = loop {
+            let id = self.next_request_id("prompt");
+            let command = json!({
+                "type": "prompt",
+                "id": id,
+                "message": rendered,
+            });
+            self.write_frame(&command).await?;
+
+            match self.wait_for_prompt_ack(&id).await? {
+                RpcResponse::Success {
+                    response,
+                    frames: ack_frames,
+                } => {
+                    frames.extend(ack_frames);
+                    break response;
+                }
+                RpcResponse::RetryableBusy {
+                    response,
+                    frames: ack_frames,
+                } => {
+                    frames.extend(ack_frames);
+                    frames.push(response);
+                    self.wait_before_retry(retry_deadline, retry_count, &mut frames)
+                        .await?;
+                    retry_count = retry_count.saturating_add(1);
+                }
+            }
+        };
+
         loop {
             let frame = self
                 .read_frame_with_timeout(TimeoutKind::PromptIdle)
@@ -361,21 +427,20 @@ impl OmpRpc {
         stdin.flush().await.context("failed to flush rpc command")
     }
 
-    async fn wait_for_command_response(&mut self, id: &str) -> Result<(Value, Vec<Value>)> {
+    async fn wait_for_command_response(&mut self, id: &str) -> Result<RpcResponse> {
         let mut frames = Vec::new();
         loop {
             let frame = self
                 .read_frame_with_timeout(TimeoutKind::CommandResponse)
                 .await?;
             if frame_id(&frame) == Some(id) {
-                ensure_success(&frame)?;
-                return Ok((frame, frames));
+                return response_status(frame, frames);
             }
             frames.push(frame);
         }
     }
 
-    async fn wait_for_prompt_ack(&mut self, id: &str) -> Result<(Value, Vec<Value>)> {
+    async fn wait_for_prompt_ack(&mut self, id: &str) -> Result<RpcResponse> {
         let mut frames = Vec::new();
         loop {
             let frame = self
@@ -385,10 +450,47 @@ impl OmpRpc {
                 bail!("agent_end arrived before prompt ack for {id}");
             }
             if frame_id(&frame) == Some(id) {
-                ensure_success(&frame)?;
-                return Ok((frame, frames));
+                return response_status(frame, frames);
             }
             frames.push(frame);
+        }
+    }
+
+    async fn wait_before_retry(
+        &mut self,
+        deadline: Instant,
+        retry_count: usize,
+        frames: &mut Vec<Value>,
+    ) -> Result<()> {
+        let delay = retry_delay(retry_count);
+        let now = Instant::now();
+        if now >= deadline {
+            bail!(
+                "omp rpc remained busy for {} seconds",
+                self.timeouts.prompt_idle.as_secs()
+            );
+        }
+        let retry_at = (now + delay).min(deadline);
+
+        loop {
+            let remaining = retry_at.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            match timeout(remaining, self.frames.recv()).await {
+                Ok(Some(Ok(frame))) => frames.push(frame),
+                Ok(Some(Err(error))) => bail!("{error}"),
+                Ok(None) => {
+                    let stderr = self.stderr.lock().await;
+                    if stderr.is_empty() {
+                        bail!("omp rpc process closed stdout while waiting to retry busy command");
+                    }
+                    bail!(
+                        "omp rpc process closed stdout while waiting to retry busy command; stderr: {stderr}"
+                    );
+                }
+                Err(_) => return Ok(()),
+            }
         }
     }
 
@@ -430,6 +532,42 @@ impl OmpRpc {
     }
 }
 
+fn response_status(response: Value, frames: Vec<Value>) -> Result<RpcResponse> {
+    if response.get("success").and_then(Value::as_bool) == Some(false) {
+        if is_retryable_busy_response(&response) {
+            return Ok(RpcResponse::RetryableBusy { response, frames });
+        }
+        bail!("rpc command failed: {response}");
+    }
+
+    Ok(RpcResponse::Success { response, frames })
+}
+
+fn is_retryable_busy_response(response: &Value) -> bool {
+    response.get("success").and_then(Value::as_bool) == Some(false)
+        && response
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(is_retryable_busy_error)
+}
+
+fn is_retryable_busy_error(error: &str) -> bool {
+    error.contains("already processing") || error.contains("Already processing")
+}
+
+fn retry_deadline(duration: Duration) -> Instant {
+    Instant::now() + duration
+}
+
+fn retry_delay(retry_count: usize) -> Duration {
+    let multiplier = 1_u64 << retry_count.min(4);
+    let seconds = RETRY_INITIAL_DELAY
+        .as_secs()
+        .saturating_mul(multiplier)
+        .min(RETRY_MAX_DELAY.as_secs());
+    Duration::from_secs(seconds)
+}
+
 fn duration_from_env(name: &'static str, default: Duration) -> Result<Duration> {
     match env::var(name) {
         Ok(value) => parse_timeout_seconds(name, &value),
@@ -455,13 +593,6 @@ fn frame_type(frame: &Value) -> Option<&str> {
 
 fn frame_id(frame: &Value) -> Option<&str> {
     frame.get("id").and_then(Value::as_str)
-}
-
-fn ensure_success(frame: &Value) -> Result<()> {
-    match frame.get("success").and_then(Value::as_bool) {
-        Some(false) => bail!("rpc command failed: {frame}"),
-        _ => Ok(()),
-    }
 }
 
 fn session_info_from_response(response: &Value) -> Result<SessionInfo> {
@@ -537,10 +668,38 @@ mod tests {
     }
 
     #[test]
-    fn ensure_success_rejects_false_response() {
-        let response = json!({ "id": "req-1", "success": false });
+    fn response_status_marks_busy_failure_retryable() -> Result<()> {
+        let response = json!({
+            "id": "prompt-90",
+            "command": "prompt",
+            "success": false,
+            "error": "Agent is already processing. Use steer() or followUp() to queue messages, or wait for completion.",
+        });
 
-        assert!(ensure_success(&response).is_err());
+        let status = response_status(response, Vec::new())?;
+
+        assert!(matches!(status, RpcResponse::RetryableBusy { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn response_status_rejects_non_retryable_failure() {
+        let response = json!({
+            "id": "prompt-91",
+            "command": "prompt",
+            "success": false,
+            "error": "malformed prompt",
+        });
+
+        assert!(response_status(response, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn retry_delay_should_exponentially_back_off_and_cap() {
+        assert_eq!(retry_delay(0), Duration::from_secs(1));
+        assert_eq!(retry_delay(1), Duration::from_secs(2));
+        assert_eq!(retry_delay(4), Duration::from_secs(15));
+        assert_eq!(retry_delay(10), Duration::from_secs(15));
     }
 
     #[test]

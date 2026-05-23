@@ -395,16 +395,31 @@ In that case AgentFlow sends the message to the active OMP session, waits for `a
 
 ## Local Files
 
-Keep local files minimal:
+Keep local files minimal. Always write resumability state:
 
 ```text
 .agentflow/
   state.json
   runs/
     M14/
+      sessions.json
+```
+
+Verbose prompt/RPC logs are optional and disabled by default:
+
+```yaml
+logs:
+  enabled: true
+```
+
+When enabled, also write:
+
+```text
+.agentflow/
+  runs/
+    M14/
       rendered-prompts.jsonl
       outputs.jsonl
-      sessions.json
 ```
 
 `state.json` is for crash visibility/recovery only. It is not a workflow database.
@@ -413,9 +428,9 @@ When paused, `state.json` must include the active `sessionFile` so `agentflow op
 
 Output recording recommendation:
 
-- `rendered-prompts.jsonl`: one record per prompt with `run_id`, `item_id`, `counter`, `iteration`, `prompt_index`, `prompt_id`, `session_id`, `session_file`, and rendered `text`.
-- `outputs.jsonl`: append raw OMP frames, control events, state transitions, and command errors in observation order.
 - `sessions.json`: record every observed session with `prompt_id`, `session_id`, `session_file`, `started_at`, and why it was created (`initial`, `new_session`, `resume`).
+- `rendered-prompts.jsonl`: when verbose logs are enabled, record one entry per prompt with `run_id`, `item_id`, `counter`, `iteration`, `prompt_index`, `prompt_id`, `session_id`, `session_file`, and rendered `text`.
+- `outputs.jsonl`: when verbose logs are enabled, append raw OMP frames, control events, state transitions, and command errors in observation order.
 
 Recommended `state.json` shape:
 

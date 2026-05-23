@@ -218,16 +218,31 @@ agentflow --config path/to/.agentflow.yml --repo-root path/to/repo --state path/
 
 ## Local files
 
-AgentFlow writes local run state under `.agentflow/` in the target repository:
+AgentFlow always writes resumability state under `.agentflow/` in the target repository:
 
 ```text
 .agentflow/
   state.json
   runs/
     M14/
+      sessions.json
+```
+
+Verbose prompt/RPC logs are disabled by default. To write them for debugging, opt in from `.agentflow.yml`:
+
+```yaml
+logs:
+  enabled: true
+```
+
+When enabled, AgentFlow also writes:
+
+```text
+.agentflow/
+  runs/
+    M14/
       rendered-prompts.jsonl
       outputs.jsonl
-      sessions.json
 ```
 
 These files are for visibility and crash recovery. They are not a database.

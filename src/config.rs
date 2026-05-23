@@ -14,6 +14,8 @@ pub struct Config {
     #[serde(rename = "loop")]
     pub loop_: LoopConfig,
     pub notify: Option<NotifyConfig>,
+    #[serde(default)]
+    pub logs: LogConfig,
     pub prompts: Vec<PromptStep>,
 }
 
@@ -37,6 +39,13 @@ pub struct LoopConfig {
 #[serde(deny_unknown_fields)]
 pub struct NotifyConfig {
     pub command: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LogConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
@@ -226,6 +235,7 @@ mod tests {
                     "{{message}} {{item_id}}".to_owned(),
                 ]),
             }),
+            logs: LogConfig::default(),
             prompts: vec![PromptStep {
                 id: "plan".to_owned(),
                 text: "Do {{item_id}} from {{repo_root}}".to_owned(),
@@ -234,6 +244,48 @@ mod tests {
                 message: Some("Pause {{item_id}}".to_owned()),
             }],
         }
+    }
+
+    #[test]
+    fn load_config_should_disable_verbose_logs_by_default() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+provider: omp
+loop:
+  start: 1
+  count: 1
+  step: 1
+  item_id: "M{{counter}}"
+prompts:
+  - id: plan
+    text: plan
+"#,
+        )
+        .expect("config should parse");
+
+        assert!(!config.logs.enabled);
+    }
+
+    #[test]
+    fn load_config_should_accept_enabled_verbose_logs() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+provider: omp
+loop:
+  start: 1
+  count: 1
+  step: 1
+  item_id: "M{{counter}}"
+logs:
+  enabled: true
+prompts:
+  - id: plan
+    text: plan
+"#,
+        )
+        .expect("config should parse");
+
+        assert!(config.logs.enabled);
     }
 
     #[test]

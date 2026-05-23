@@ -432,7 +432,7 @@ async fn drive_flow_inner(
             .get(request.start_item_index)
             .ok_or_else(|| anyhow!("resume item index is out of range"))?;
         let (resumed_session, frames) = rpc.get_state_with_frames().await?;
-        append_rpc_frames(request.paths, &item.item_id, &frames).await?;
+        append_rpc_frames(request.config, request.paths, &item.item_id, &frames).await?;
         record_session_info(
             request.paths,
             item,
@@ -470,8 +470,14 @@ async fn drive_flow_inner(
             "resume-message",
         )
         .await?;
-        append_rpc_frame(request.paths, &item.item_id, &outcome.ack).await?;
-        append_rpc_frames(request.paths, &item.item_id, &outcome.frames).await?;
+        append_rpc_frame(request.config, request.paths, &item.item_id, &outcome.ack).await?;
+        append_rpc_frames(
+            request.config,
+            request.paths,
+            &item.item_id,
+            &outcome.frames,
+        )
+        .await?;
         let pending = drain_control_events(control_rx, None);
         if let Some(event) = pending {
             return handle_control_stop(
@@ -516,7 +522,7 @@ async fn drive_flow_inner(
             let need_new_session = force_new_session || (session.is_some() && prompt.new_session);
             if need_new_session {
                 let (new_session, frames) = rpc.new_session_with_frames().await?;
-                append_rpc_frames(request.paths, &item.item_id, &frames).await?;
+                append_rpc_frames(request.config, request.paths, &item.item_id, &frames).await?;
                 record_session_info(
                     request.paths,
                     item,
@@ -529,7 +535,7 @@ async fn drive_flow_inner(
                 force_new_session = false;
             } else if session.is_none() {
                 let (initial_session, frames) = rpc.get_state_with_frames().await?;
-                append_rpc_frames(request.paths, &item.item_id, &frames).await?;
+                append_rpc_frames(request.config, request.paths, &item.item_id, &frames).await?;
                 record_session_info(
                     request.paths,
                     item,
@@ -562,7 +568,8 @@ async fn drive_flow_inner(
 
             let context = build_context(item, request.repo_root, None);
             let rendered = render_prompt(prompt, &context)?;
-            append_rendered_prompt(
+            append_logged_rendered_prompt(
+                request.config,
                 request.paths,
                 &item.item_id,
                 &json!({
@@ -600,8 +607,14 @@ async fn drive_flow_inner(
                 &prompt.id,
             )
             .await?;
-            append_rpc_frame(request.paths, &item.item_id, &outcome.ack).await?;
-            append_rpc_frames(request.paths, &item.item_id, &outcome.frames).await?;
+            append_rpc_frame(request.config, request.paths, &item.item_id, &outcome.ack).await?;
+            append_rpc_frames(
+                request.config,
+                request.paths,
+                &item.item_id,
+                &outcome.frames,
+            )
+            .await?;
 
             let mut control = drain_control_events(control_rx, None);
             if prompt.pause_after && control.is_none() {
@@ -650,7 +663,8 @@ async fn handle_control_stop(
     let notify_error =
         run_notify_command(request.config.notify.as_ref(), &context, message).await?;
     if let Some(error) = notify_error.as_ref() {
-        append_output(
+        append_logged_output(
+            request.config,
             request.paths,
             &item.item_id,
             &json!({ "kind": "error", "message": error }),
@@ -677,6 +691,7 @@ async fn handle_control_stop(
                 last_error: notify_error.clone(),
             };
             append_transition(
+                request.config,
                 request.paths,
                 &item.item_id,
                 RunStatus::Running,
@@ -701,6 +716,7 @@ async fn handle_control_stop(
                 last_error: notify_error,
             };
             append_transition(
+                request.config,
                 request.paths,
                 &item.item_id,
                 RunStatus::Running,
@@ -869,8 +885,44 @@ async fn persist_failure(request: &DriveRequest<'_>, item: &LoopItem, error: &st
     save_state(&request.paths.state_path, &state).await
 }
 
-async fn append_rpc_frame(paths: &AgentFlowPaths, item_id: &str, frame: &Value) -> Result<()> {
-    append_output(
+async fn append_logged_output<T>(
+    config: &Config,
+    paths: &AgentFlowPaths,
+    item_id: &str,
+    record: &T,
+) -> Result<()>
+where
+    T: Serialize + ?Sized,
+{
+    if config.logs.enabled {
+        append_output(paths, item_id, record).await?;
+    }
+    Ok(())
+}
+
+async fn append_logged_rendered_prompt<T>(
+    config: &Config,
+    paths: &AgentFlowPaths,
+    item_id: &str,
+    record: &T,
+) -> Result<()>
+where
+    T: Serialize + ?Sized,
+{
+    if config.logs.enabled {
+        append_rendered_prompt(paths, item_id, record).await?;
+    }
+    Ok(())
+}
+
+async fn append_rpc_frame(
+    config: &Config,
+    paths: &AgentFlowPaths,
+    item_id: &str,
+    frame: &Value,
+) -> Result<()> {
+    append_logged_output(
+        config,
         paths,
         item_id,
         &json!({ "kind": "omp_frame", "frame": frame }),
@@ -878,21 +930,28 @@ async fn append_rpc_frame(paths: &AgentFlowPaths, item_id: &str, frame: &Value) 
     .await
 }
 
-async fn append_rpc_frames(paths: &AgentFlowPaths, item_id: &str, frames: &[Value]) -> Result<()> {
+async fn append_rpc_frames(
+    config: &Config,
+    paths: &AgentFlowPaths,
+    item_id: &str,
+    frames: &[Value],
+) -> Result<()> {
     for frame in frames {
-        append_rpc_frame(paths, item_id, frame).await?;
+        append_rpc_frame(config, paths, item_id, frame).await?;
     }
     Ok(())
 }
 
 async fn append_transition(
+    config: &Config,
     paths: &AgentFlowPaths,
     item_id: &str,
     from: RunStatus,
     to: RunStatus,
     reason: &str,
 ) -> Result<()> {
-    append_output(
+    append_logged_output(
+        config,
         paths,
         item_id,
         &json!({
@@ -975,7 +1034,7 @@ fn sanitize_run_id(run_id: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::config::{Config, LoopConfig, PromptStep, Provider};
+    use crate::config::{Config, LogConfig, LoopConfig, PromptStep, Provider};
 
     use super::*;
 
@@ -990,6 +1049,7 @@ mod tests {
                 item_id: "M{{counter}}".to_owned(),
             },
             notify: None,
+            logs: LogConfig::default(),
             prompts: vec![
                 PromptStep {
                     id: "plan".to_owned(),
@@ -1194,6 +1254,50 @@ mod tests {
         assert_eq!(failed.current.prompt_index, 1);
         assert_eq!(failed.current.session_file, Some(session_file));
         assert_eq!(failed.last_error.as_deref(), Some("rpc timeout"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verbose_logs_should_not_be_written_by_default() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let paths = AgentFlowPaths::new(tempdir.path().to_path_buf(), None);
+        let config = test_config();
+
+        append_rpc_frame(&config, &paths, "M1", &json!({ "type": "message_end" })).await?;
+        append_logged_rendered_prompt(
+            &config,
+            &paths,
+            "M1",
+            &json!({ "prompt_id": "plan", "text": "hello" }),
+        )
+        .await?;
+
+        assert!(!paths.outputs_path("M1").exists());
+        assert!(!paths.rendered_prompts_path("M1").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verbose_logs_should_be_written_when_enabled() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let paths = AgentFlowPaths::new(tempdir.path().to_path_buf(), None);
+        let mut config = test_config();
+        config.logs.enabled = true;
+
+        append_rpc_frame(&config, &paths, "M1", &json!({ "type": "message_end" })).await?;
+        append_logged_rendered_prompt(
+            &config,
+            &paths,
+            "M1",
+            &json!({ "prompt_id": "plan", "text": "hello" }),
+        )
+        .await?;
+
+        let output = tokio::fs::read_to_string(paths.outputs_path("M1")).await?;
+        let rendered = tokio::fs::read_to_string(paths.rendered_prompts_path("M1")).await?;
+
+        assert!(output.contains("\"kind\":\"omp_frame\""));
+        assert!(rendered.contains("\"text\":\"hello\""));
         Ok(())
     }
 

@@ -110,7 +110,7 @@ fn build_item(
 mod tests {
     use std::path::Path;
 
-    use crate::config::{Config, LoopConfig, Provider};
+    use crate::config::{Config, LogConfig, LoopConfig, Provider};
 
     use super::*;
 
@@ -119,6 +119,7 @@ mod tests {
             provider: Provider::Omp,
             loop_,
             notify: None,
+            logs: LogConfig::default(),
             prompts: vec![],
         }
     }

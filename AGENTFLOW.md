@@ -62,6 +62,9 @@ loop:
   step: 1
   item_id: "M{{counter}}"
 
+sessions:
+  enabled: true # required for pause_after/open/resume; disabled by default otherwise
+
 notify:
   command: null    # optional argv list, e.g. ["terminal-notifier", "-message", "{{message}}"]
 
@@ -131,6 +134,8 @@ Recommendation:
 - Unknown fields should be rejected instead of ignored.
 - Unknown template variables should fail config validation before the run starts.
 - `pause_after: true` requires a non-empty `message`.
+- `sessions.enabled` defaults to `false`; when false, AgentFlow starts OMP with `--no-session`.
+- `pause_after: true` requires `sessions.enabled: true` because `agentflow open` needs a persisted OMP session file.
 - `notify.command` should be an argv list, not a shell string, to avoid quoting bugs. Example: `["terminal-notifier", "-message", "{{message}}"]`.
 
 ## Template Variables
@@ -400,10 +405,18 @@ Keep local files minimal. Always write resumability state:
 ```text
 .agentflow/
   state.json
-  runs/
-    M14/
-      sessions.json
 ```
+
+OMP conversation/session persistence is optional and disabled by default:
+
+```yaml
+sessions:
+  enabled: true
+```
+
+When `sessions.enabled` is false, AgentFlow should start RPC with `omp --no-session`
+and should not write `runs/<item>/sessions.json`. Persisted sessions are required for
+`pause_after`, `agentflow open`, and durable resume from a saved OMP session.
 
 Verbose prompt/RPC logs are optional and disabled by default:
 
@@ -412,12 +425,13 @@ logs:
   enabled: true
 ```
 
-When enabled, also write:
+When verbose logs are enabled, also write:
 
 ```text
 .agentflow/
   runs/
     M14/
+      sessions.json
       rendered-prompts.jsonl
       outputs.jsonl
 ```
@@ -428,7 +442,7 @@ When paused, `state.json` must include the active `sessionFile` so `agentflow op
 
 Output recording recommendation:
 
-- `sessions.json`: record every observed session with `prompt_id`, `session_id`, `session_file`, `started_at`, and why it was created (`initial`, `new_session`, `resume`).
+- `sessions.json`: when verbose logs are enabled, record every observed session with `prompt_id`, `session_id`, `session_file`, `started_at`, and why it was created (`initial`, `new_session`, `resume`).
 - `rendered-prompts.jsonl`: when verbose logs are enabled, record one entry per prompt with `run_id`, `item_id`, `counter`, `iteration`, `prompt_index`, `prompt_id`, `session_id`, `session_file`, and rendered `text`.
 - `outputs.jsonl`: when verbose logs are enabled, append raw OMP frames, control events, state transitions, and command errors in observation order.
 

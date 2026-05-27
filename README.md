@@ -57,6 +57,11 @@ loop:
   step: 1
   item_id: "M{{counter}}"
 
+sessions:
+  # Disabled by default. Enable only when a flow needs persisted OMP sessions
+  # for pause/open/resume behavior.
+  enabled: true
+
 notify:
   command:
     - curl
@@ -217,18 +222,25 @@ agentflow --config path/to/.agentflow.yml --repo-root path/to/repo --state path/
 ```
 
 ## Local files
-
-AgentFlow always writes resumability state under `.agentflow/` in the target repository:
+AgentFlow always writes minimal run state under `.agentflow/` in the target repository:
 
 ```text
 .agentflow/
   state.json
-  runs/
-    M14/
-      sessions.json
 ```
 
-Verbose prompt/RPC logs are disabled by default. To write them for debugging, opt in from `.agentflow.yml`:
+OMP conversation/session files are disabled by default; AgentFlow starts RPC with
+`omp --no-session` unless session persistence is explicitly enabled or it is resuming an
+existing saved session. Enable persisted sessions only for flows that need
+`pause_after`, `agentflow open`, or durable `agentflow resume`:
+
+```yaml
+sessions:
+  enabled: true
+```
+
+Verbose prompt/RPC logs are also disabled by default. To write them for debugging, opt in
+from `.agentflow.yml`:
 
 ```yaml
 logs:
@@ -241,6 +253,7 @@ When enabled, AgentFlow also writes:
 .agentflow/
   runs/
     M14/
+      sessions.json
       rendered-prompts.jsonl
       outputs.jsonl
 ```

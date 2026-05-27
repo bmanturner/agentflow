@@ -16,6 +16,8 @@ pub struct Config {
     pub notify: Option<NotifyConfig>,
     #[serde(default)]
     pub logs: LogConfig,
+    #[serde(default)]
+    pub sessions: SessionConfig,
     pub prompts: Vec<PromptStep>,
 }
 
@@ -44,6 +46,13 @@ pub struct NotifyConfig {
 #[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LogConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConfig {
     #[serde(default)]
     pub enabled: bool,
 }
@@ -95,7 +104,7 @@ pub fn validate_config(config: &Config, repo_root: &Path) -> Result<()> {
     validate_loop_config(&config.loop_, &mut errors);
     validate_prompts(&config.prompts, &mut errors);
     validate_notify(config.notify.as_ref(), &mut errors);
-
+    validate_session_config(config, &mut errors);
     if errors.is_empty() {
         validate_templates(config, repo_root, &mut errors);
     }
@@ -173,6 +182,21 @@ fn validate_notify(notify: Option<&NotifyConfig>, errors: &mut Vec<String>) {
         }
     }
 }
+fn validate_session_config(config: &Config, errors: &mut Vec<String>) {
+    if config.sessions.enabled {
+        return;
+    }
+    if let Some((index, _)) = config
+        .prompts
+        .iter()
+        .enumerate()
+        .find(|(_, prompt)| prompt.pause_after)
+    {
+        errors.push(format!(
+            "sessions.enabled must be true when prompts[{index}].pause_after is true"
+        ));
+    }
+}
 
 fn validate_templates(config: &Config, repo_root: &Path, errors: &mut Vec<String>) {
     let plan = match build_loop_plan(config, repo_root) {
@@ -235,6 +259,7 @@ mod tests {
                     "{{message}} {{item_id}}".to_owned(),
                 ]),
             }),
+            sessions: SessionConfig::default(),
             logs: LogConfig::default(),
             prompts: vec![PromptStep {
                 id: "plan".to_owned(),
@@ -247,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn load_config_should_disable_verbose_logs_by_default() {
+    fn load_config_should_disable_logs_and_sessions_by_default() {
         let config: Config = serde_yaml::from_str(
             r#"
 provider: omp
@@ -264,6 +289,7 @@ prompts:
         .expect("config should parse");
 
         assert!(!config.logs.enabled);
+        assert!(!config.sessions.enabled);
     }
 
     #[test]
@@ -289,8 +315,32 @@ prompts:
     }
 
     #[test]
+    fn load_config_should_accept_enabled_sessions() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+provider: omp
+loop:
+  start: 1
+  count: 1
+  step: 1
+  item_id: "M{{counter}}"
+sessions:
+  enabled: true
+prompts:
+  - id: plan
+    text: plan
+"#,
+        )
+        .expect("config should parse");
+
+        assert!(config.sessions.enabled);
+    }
+
+    #[test]
     fn validate_config_should_accept_valid_config() {
-        let result = validate_config(&valid_config(), Path::new("/repo"));
+        let mut config = valid_config();
+        config.sessions.enabled = true;
+        let result = validate_config(&config, Path::new("/repo"));
         assert!(result.is_ok());
     }
 
@@ -316,11 +366,24 @@ prompts:
         assert!(err.contains("loop.step must be greater than 0"));
         assert!(err.contains("duplicate prompt id"));
         assert!(err.contains("text must not be empty"));
+        assert!(err.contains("sessions.enabled must be true"));
+    }
+
+    #[test]
+    fn validate_config_should_require_sessions_for_pause_after() {
+        let config = valid_config();
+        let err = validate_config(&config, Path::new("/repo"))
+            .err()
+            .map(|err| err.to_string())
+            .unwrap_or_default();
+
+        assert!(err.contains("sessions.enabled must be true"));
     }
 
     #[test]
     fn validate_config_should_fail_unknown_template_variables() {
         let mut config = valid_config();
+        config.sessions.enabled = true;
         config.prompts[0].text = "{{missing}}".to_owned();
         let result = validate_config(&config, Path::new("/repo"));
         assert!(result.is_err());

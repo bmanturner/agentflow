@@ -20,6 +20,7 @@ const READY_TIMEOUT_ENV: &str = "AGENTFLOW_OMP_READY_TIMEOUT_SECONDS";
 const COMMAND_TIMEOUT_ENV: &str = "AGENTFLOW_OMP_COMMAND_TIMEOUT_SECONDS";
 const PROMPT_IDLE_TIMEOUT_ENV: &str = "AGENTFLOW_OMP_PROMPT_IDLE_TIMEOUT_SECONDS";
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const STDERR_BUFFER_LIMIT: usize = 1024 * 1024;
 const KILL_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
@@ -32,7 +33,7 @@ pub struct SessionInfo {
 
 #[derive(Debug)]
 pub struct PromptOutcome {
-    pub ack: Value,
+    pub ack: Option<Value>,
     pub frames: Vec<Value>,
 }
 
@@ -118,6 +119,7 @@ impl OmpRpc {
         control_socket: impl AsRef<Path>,
         item_id: &str,
         counter: i64,
+        persist_session: bool,
     ) -> Result<Self> {
         let timeouts = RpcTimeouts::from_env()?;
 
@@ -129,12 +131,15 @@ impl OmpRpc {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .env("AGENTFLOW_CONTROL_SOCKET", control_socket.as_ref())
             .env("AGENTFLOW_ITEM_ID", item_id)
             .env("AGENTFLOW_COUNTER", counter.to_string());
 
         if let Some(session) = resume_session {
             command.arg("--resume").arg(session);
+        } else if should_disable_omp_session(resume_session, persist_session) {
+            command.arg("--no-session");
         }
 
         let mut child = command.spawn().context("failed to start omp rpc process")?;
@@ -180,19 +185,15 @@ impl OmpRpc {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
                         let mut buffer = stderr_for_task.lock().await;
-                        if !buffer.is_empty() {
-                            buffer.push('\n');
-                        }
-                        buffer.push_str(&line);
+                        append_capped_stderr_line(&mut buffer, &line);
                     }
                     Ok(None) => break,
                     Err(error) => {
                         let mut buffer = stderr_for_task.lock().await;
-                        if !buffer.is_empty() {
-                            buffer.push('\n');
-                        }
-                        buffer.push_str("failed reading omp stderr: ");
-                        buffer.push_str(&error.to_string());
+                        append_capped_stderr_line(
+                            &mut buffer,
+                            &format!("failed reading omp stderr: {error}"),
+                        );
                         break;
                     }
                 }
@@ -218,7 +219,11 @@ impl OmpRpc {
         Ok(rpc)
     }
 
-    pub async fn command(&mut self, mut command: Value) -> Result<(Value, Vec<Value>)> {
+    pub async fn command(
+        &mut self,
+        mut command: Value,
+        collect_frames: bool,
+    ) -> Result<(Value, Vec<Value>)> {
         let (command_name, caller_supplied_id) = {
             let object = command
                 .as_object_mut()
@@ -257,23 +262,36 @@ impl OmpRpc {
             };
 
             self.write_frame(&command).await?;
-            match self.wait_for_command_response(&id).await? {
+            match self.wait_for_command_response(&id, collect_frames).await? {
                 RpcResponse::Success { response, frames } => {
-                    collected_frames.extend(frames);
+                    if collect_frames {
+                        collected_frames.extend(frames);
+                    }
                     return Ok((response, collected_frames));
                 }
                 RpcResponse::RetryableBusy { response, frames } => {
-                    collected_frames.extend(frames);
-                    collected_frames.push(response);
-                    self.wait_before_retry(retry_deadline, retry_count, &mut collected_frames)
-                        .await?;
+                    if collect_frames {
+                        collected_frames.extend(frames);
+                        collected_frames.push(response);
+                    }
+                    self.wait_before_retry(
+                        retry_deadline,
+                        retry_count,
+                        collect_frames,
+                        &mut collected_frames,
+                    )
+                    .await?;
                     retry_count = retry_count.saturating_add(1);
                 }
             }
         }
     }
 
-    pub async fn prompt_and_wait(&mut self, rendered: &str) -> Result<PromptOutcome> {
+    pub async fn prompt_and_wait(
+        &mut self,
+        rendered: &str,
+        collect_frames: bool,
+    ) -> Result<PromptOutcome> {
         let mut frames = Vec::new();
         let retry_deadline = retry_deadline(self.timeouts.prompt_idle);
         let mut retry_count = 0_usize;
@@ -287,22 +305,32 @@ impl OmpRpc {
             });
             self.write_frame(&command).await?;
 
-            match self.wait_for_prompt_ack(&id).await? {
+            match self.wait_for_prompt_ack(&id, collect_frames).await? {
                 RpcResponse::Success {
                     response,
                     frames: ack_frames,
                 } => {
-                    frames.extend(ack_frames);
-                    break response;
+                    if collect_frames {
+                        frames.extend(ack_frames);
+                        break Some(response);
+                    }
+                    break None;
                 }
                 RpcResponse::RetryableBusy {
                     response,
                     frames: ack_frames,
                 } => {
-                    frames.extend(ack_frames);
-                    frames.push(response);
-                    self.wait_before_retry(retry_deadline, retry_count, &mut frames)
-                        .await?;
+                    if collect_frames {
+                        frames.extend(ack_frames);
+                        frames.push(response);
+                    }
+                    self.wait_before_retry(
+                        retry_deadline,
+                        retry_count,
+                        collect_frames,
+                        &mut frames,
+                    )
+                    .await?;
                     retry_count = retry_count.saturating_add(1);
                 }
             }
@@ -313,7 +341,9 @@ impl OmpRpc {
                 .read_frame_with_timeout(TimeoutKind::PromptIdle)
                 .await?;
             let is_agent_end = frame_type(&frame) == Some("agent_end");
-            frames.push(frame);
+            if collect_frames {
+                frames.push(frame);
+            }
             if is_agent_end {
                 break;
             }
@@ -323,31 +353,47 @@ impl OmpRpc {
     }
 
     pub async fn get_state(&mut self) -> Result<SessionInfo> {
-        let (info, _) = self.get_state_with_frames().await?;
+        let (info, _) = self.get_state_with_frames(false).await?;
         Ok(info)
     }
-    pub async fn get_state_with_frames(&mut self) -> Result<(SessionInfo, Vec<Value>)> {
-        let (response, mut frames) = self.command(json!({ "type": "get_state" })).await?;
+    pub async fn get_state_with_frames(
+        &mut self,
+        collect_frames: bool,
+    ) -> Result<(SessionInfo, Vec<Value>)> {
+        let (response, mut frames) = self
+            .command(json!({ "type": "get_state" }), collect_frames)
+            .await?;
         let info = session_info_from_response(&response)?;
-        frames.push(response);
+        if collect_frames {
+            frames.push(response);
+        }
         Ok((info, frames))
     }
 
     async fn get_state_if_available(&mut self) -> Result<Option<SessionInfo>> {
-        let (response, _) = self.command(json!({ "type": "get_state" })).await?;
+        let (response, _) = self.command(json!({ "type": "get_state" }), false).await?;
         Ok(optional_session_info_from_response(&response))
     }
 
     pub async fn new_session(&mut self) -> Result<SessionInfo> {
-        let (current, _) = self.new_session_with_frames().await?;
+        let (current, _) = self.new_session_with_frames(false).await?;
         Ok(current)
     }
-    pub async fn new_session_with_frames(&mut self) -> Result<(SessionInfo, Vec<Value>)> {
+    pub async fn new_session_with_frames(
+        &mut self,
+        collect_frames: bool,
+    ) -> Result<(SessionInfo, Vec<Value>)> {
         let previous = self.get_state_if_available().await?;
-        let (response, mut frames) = self.command(json!({ "type": "new_session" })).await?;
-        frames.push(response);
-        let (current, state_frames) = self.get_state_with_frames().await?;
-        frames.extend(state_frames);
+        let (response, mut frames) = self
+            .command(json!({ "type": "new_session" }), collect_frames)
+            .await?;
+        if collect_frames {
+            frames.push(response);
+        }
+        let (current, state_frames) = self.get_state_with_frames(collect_frames).await?;
+        if collect_frames {
+            frames.extend(state_frames);
+        }
         if let Some(previous) = previous {
             if previous.session_id == current.session_id {
                 bail!("new_session did not change sessionId");
@@ -356,13 +402,26 @@ impl OmpRpc {
         Ok((current, frames))
     }
 
+    pub async fn new_session_without_state(&mut self, collect_frames: bool) -> Result<Vec<Value>> {
+        let (response, mut frames) = self
+            .command(json!({ "type": "new_session" }), collect_frames)
+            .await?;
+        if collect_frames {
+            frames.push(response);
+        }
+        Ok(frames)
+    }
+
     pub async fn switch_session(&mut self, session_path: &Path) -> Result<SessionInfo> {
         let session_path_text = session_path.to_string_lossy();
         let _ = self
-            .command(json!({
-                "type": "switch_session",
-                "sessionPath": session_path_text.as_ref(),
-            }))
+            .command(
+                json!({
+                    "type": "switch_session",
+                    "sessionPath": session_path_text.as_ref(),
+                }),
+                false,
+            )
             .await?;
         let current = self.get_state().await?;
         if current.session_file.as_path() != session_path {
@@ -377,7 +436,7 @@ impl OmpRpc {
 
     pub async fn get_last_assistant_text(&mut self) -> Result<String> {
         let (response, _) = self
-            .command(json!({ "type": "get_last_assistant_text" }))
+            .command(json!({ "type": "get_last_assistant_text" }), false)
             .await?;
         assistant_text_from_response(&response)
     }
@@ -427,7 +486,11 @@ impl OmpRpc {
         stdin.flush().await.context("failed to flush rpc command")
     }
 
-    async fn wait_for_command_response(&mut self, id: &str) -> Result<RpcResponse> {
+    async fn wait_for_command_response(
+        &mut self,
+        id: &str,
+        collect_frames: bool,
+    ) -> Result<RpcResponse> {
         let mut frames = Vec::new();
         loop {
             let frame = self
@@ -436,11 +499,13 @@ impl OmpRpc {
             if frame_id(&frame) == Some(id) {
                 return response_status(frame, frames);
             }
-            frames.push(frame);
+            if collect_frames {
+                frames.push(frame);
+            }
         }
     }
 
-    async fn wait_for_prompt_ack(&mut self, id: &str) -> Result<RpcResponse> {
+    async fn wait_for_prompt_ack(&mut self, id: &str, collect_frames: bool) -> Result<RpcResponse> {
         let mut frames = Vec::new();
         loop {
             let frame = self
@@ -452,7 +517,9 @@ impl OmpRpc {
             if frame_id(&frame) == Some(id) {
                 return response_status(frame, frames);
             }
-            frames.push(frame);
+            if collect_frames {
+                frames.push(frame);
+            }
         }
     }
 
@@ -460,6 +527,7 @@ impl OmpRpc {
         &mut self,
         deadline: Instant,
         retry_count: usize,
+        collect_frames: bool,
         frames: &mut Vec<Value>,
     ) -> Result<()> {
         let delay = retry_delay(retry_count);
@@ -478,7 +546,11 @@ impl OmpRpc {
                 return Ok(());
             }
             match timeout(remaining, self.frames.recv()).await {
-                Ok(Some(Ok(frame))) => frames.push(frame),
+                Ok(Some(Ok(frame))) => {
+                    if collect_frames {
+                        frames.push(frame);
+                    }
+                }
                 Ok(Some(Err(error))) => bail!("{error}"),
                 Ok(None) => {
                     let stderr = self.stderr.lock().await;
@@ -531,6 +603,26 @@ impl OmpRpc {
         }
     }
 }
+fn append_capped_stderr_line(buffer: &mut String, line: &str) {
+    if !buffer.is_empty() {
+        buffer.push('\n');
+    }
+    buffer.push_str(line);
+    if buffer.len() <= STDERR_BUFFER_LIMIT {
+        return;
+    }
+
+    const TRUNCATED_MARKER: &str = "[stderr truncated]\n";
+    let tail_len = STDERR_BUFFER_LIMIT.saturating_sub(TRUNCATED_MARKER.len());
+    let mut tail_start = buffer.len().saturating_sub(tail_len);
+    while tail_start < buffer.len() && !buffer.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let tail = buffer.split_off(tail_start);
+    buffer.clear();
+    buffer.push_str(TRUNCATED_MARKER);
+    buffer.push_str(&tail);
+}
 
 fn response_status(response: Value, frames: Vec<Value>) -> Result<RpcResponse> {
     if response.get("success").and_then(Value::as_bool) == Some(false) {
@@ -553,6 +645,10 @@ fn is_retryable_busy_response(response: &Value) -> bool {
 
 fn is_retryable_busy_error(error: &str) -> bool {
     error.contains("already processing") || error.contains("Already processing")
+}
+
+fn should_disable_omp_session(resume_session: Option<&Path>, persist_session: bool) -> bool {
+    resume_session.is_none() && !persist_session
 }
 
 fn retry_deadline(duration: Duration) -> Instant {
@@ -700,6 +796,16 @@ mod tests {
         assert_eq!(retry_delay(1), Duration::from_secs(2));
         assert_eq!(retry_delay(4), Duration::from_secs(15));
         assert_eq!(retry_delay(10), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn should_disable_omp_session_only_without_resume_or_persistence() {
+        assert!(should_disable_omp_session(None, false));
+        assert!(!should_disable_omp_session(None, true));
+        assert!(!should_disable_omp_session(
+            Some(Path::new("/tmp/session.jsonl")),
+            false
+        ));
     }
 
     #[test]

@@ -295,6 +295,8 @@ async fn drive_flow(request: DriveRequest<'_>) -> Result<()> {
         .items
         .get(request.start_item_index)
         .ok_or_else(|| anyhow!("resume item index is out of range"))?;
+    let persist_session =
+        session_persistence_enabled(request.config, request.resume_session.as_deref());
     let mut rpc = OmpRpc::start(
         request.omp,
         request.repo_root,
@@ -302,6 +304,7 @@ async fn drive_flow(request: DriveRequest<'_>) -> Result<()> {
         &socket_path,
         &first_item.item_id,
         first_item.counter,
+        persist_session,
     )
     .await?;
 
@@ -340,13 +343,14 @@ async fn prompt_with_progress(
     prompt_index: usize,
     total_prompts: usize,
     prompt_id: &str,
+    collect_frames: bool,
 ) -> Result<PromptOutcome> {
     let mut tick = 0_usize;
     let mut ticker = tokio::time::interval(Duration::from_millis(120));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     write_progress_line(item, prompt_index, total_prompts, prompt_id, tick)?;
 
-    let prompt = rpc.prompt_and_wait(rendered);
+    let prompt = rpc.prompt_and_wait(rendered, collect_frames);
     tokio::pin!(prompt);
 
     loop {
@@ -425,22 +429,27 @@ async fn drive_flow_inner(
 ) -> Result<DriveEnd> {
     let mut session: Option<SessionInfo> = None;
     let mut force_new_session = request.resume_session.is_some() && request.start_prompt_index == 0;
+    let persist_session =
+        session_persistence_enabled(request.config, request.resume_session.as_deref());
+    let collect_frames = request.config.logs.enabled;
     if request.resume_session.is_some() {
         let item = request
             .plan
             .items
             .get(request.start_item_index)
             .ok_or_else(|| anyhow!("resume item index is out of range"))?;
-        let (resumed_session, frames) = rpc.get_state_with_frames().await?;
+        let (resumed_session, frames) = rpc.get_state_with_frames(collect_frames).await?;
         append_rpc_frames(request.config, request.paths, &item.item_id, &frames).await?;
-        record_session_info(
-            request.paths,
-            item,
-            current_prompt_id(request.config, request.start_prompt_index),
-            &resumed_session,
-            "resume",
-        )
-        .await?;
+        if request.config.logs.enabled {
+            record_session_info(
+                request.paths,
+                item,
+                current_prompt_id(request.config, request.start_prompt_index),
+                &resumed_session,
+                "resume",
+            )
+            .await?;
+        }
         session = Some(resumed_session);
     }
 
@@ -468,9 +477,12 @@ async fn drive_flow_inner(
             request.start_prompt_index,
             request.config.prompts.len(),
             "resume-message",
+            collect_frames,
         )
         .await?;
-        append_rpc_frame(request.config, request.paths, &item.item_id, &outcome.ack).await?;
+        if let Some(ack) = outcome.ack.as_ref() {
+            append_rpc_frame(request.config, request.paths, &item.item_id, ack).await?;
+        }
         append_rpc_frames(
             request.config,
             request.paths,
@@ -519,31 +531,44 @@ async fn drive_flow_inner(
                 .await;
             }
 
-            let need_new_session = force_new_session || (session.is_some() && prompt.new_session);
+            let need_new_session = force_new_session
+                || (prompt.new_session && (session.is_some() || !persist_session));
             if need_new_session {
-                let (new_session, frames) = rpc.new_session_with_frames().await?;
-                append_rpc_frames(request.config, request.paths, &item.item_id, &frames).await?;
-                record_session_info(
-                    request.paths,
-                    item,
-                    prompt.id.as_str(),
-                    &new_session,
-                    "new_session",
-                )
-                .await?;
-                session = Some(new_session);
+                if persist_session {
+                    let (new_session, frames) = rpc.new_session_with_frames(collect_frames).await?;
+                    append_rpc_frames(request.config, request.paths, &item.item_id, &frames)
+                        .await?;
+                    if request.config.logs.enabled {
+                        record_session_info(
+                            request.paths,
+                            item,
+                            prompt.id.as_str(),
+                            &new_session,
+                            "new_session",
+                        )
+                        .await?;
+                    }
+                    session = Some(new_session);
+                } else {
+                    let frames = rpc.new_session_without_state(collect_frames).await?;
+                    append_rpc_frames(request.config, request.paths, &item.item_id, &frames)
+                        .await?;
+                    session = None;
+                }
                 force_new_session = false;
-            } else if session.is_none() {
-                let (initial_session, frames) = rpc.get_state_with_frames().await?;
+            } else if session.is_none() && persist_session {
+                let (initial_session, frames) = rpc.get_state_with_frames(collect_frames).await?;
                 append_rpc_frames(request.config, request.paths, &item.item_id, &frames).await?;
-                record_session_info(
-                    request.paths,
-                    item,
-                    prompt.id.as_str(),
-                    &initial_session,
-                    "initial",
-                )
-                .await?;
+                if request.config.logs.enabled {
+                    record_session_info(
+                        request.paths,
+                        item,
+                        prompt.id.as_str(),
+                        &initial_session,
+                        "initial",
+                    )
+                    .await?;
+                }
                 session = Some(initial_session);
             }
 
@@ -568,23 +593,25 @@ async fn drive_flow_inner(
 
             let context = build_context(item, request.repo_root, None);
             let rendered = render_prompt(prompt, &context)?;
-            append_logged_rendered_prompt(
-                request.config,
-                request.paths,
-                &item.item_id,
-                &json!({
-                    "run_id": request.run_id,
-                    "item_id": item.item_id,
-                    "counter": item.counter,
-                    "iteration": item.iteration,
-                    "prompt_index": prompt_index,
-                    "prompt_id": prompt.id,
-                    "session_id": session.as_ref().map(|s| s.session_id.as_str()),
-                    "session_file": session.as_ref().map(|s| s.session_file.to_string_lossy().into_owned()),
-                    "text": rendered,
-                }),
-            )
-            .await?;
+            if request.config.logs.enabled {
+                append_logged_rendered_prompt(
+                    request.config,
+                    request.paths,
+                    &item.item_id,
+                    &json!({
+                        "run_id": request.run_id,
+                        "item_id": item.item_id,
+                        "counter": item.counter,
+                        "iteration": item.iteration,
+                        "prompt_index": prompt_index,
+                        "prompt_id": prompt.id,
+                        "session_id": session.as_ref().map(|s| s.session_id.as_str()),
+                        "session_file": session.as_ref().map(|s| s.session_file.to_string_lossy().into_owned()),
+                        "text": rendered,
+                    }),
+                )
+                .await?;
+            }
 
             if let Some(event) = drain_control_events(control_rx, None) {
                 return handle_control_stop(
@@ -605,9 +632,12 @@ async fn drive_flow_inner(
                 prompt_index,
                 request.config.prompts.len(),
                 &prompt.id,
+                collect_frames,
             )
             .await?;
-            append_rpc_frame(request.config, request.paths, &item.item_id, &outcome.ack).await?;
+            if let Some(ack) = outcome.ack.as_ref() {
+                append_rpc_frame(request.config, request.paths, &item.item_id, ack).await?;
+            }
             append_rpc_frames(
                 request.config,
                 request.paths,
@@ -914,6 +944,9 @@ where
     }
     Ok(())
 }
+fn session_persistence_enabled(config: &Config, resume_session: Option<&Path>) -> bool {
+    resume_session.is_some() || config.sessions.enabled
+}
 
 async fn append_rpc_frame(
     config: &Config,
@@ -921,6 +954,9 @@ async fn append_rpc_frame(
     item_id: &str,
     frame: &Value,
 ) -> Result<()> {
+    if !config.logs.enabled {
+        return Ok(());
+    }
     append_logged_output(
         config,
         paths,
@@ -950,6 +986,9 @@ async fn append_transition(
     to: RunStatus,
     reason: &str,
 ) -> Result<()> {
+    if !config.logs.enabled {
+        return Ok(());
+    }
     append_logged_output(
         config,
         paths,
@@ -1034,7 +1073,7 @@ fn sanitize_run_id(run_id: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::config::{Config, LogConfig, LoopConfig, PromptStep, Provider};
+    use crate::config::{Config, LogConfig, LoopConfig, PromptStep, Provider, SessionConfig};
 
     use super::*;
 
@@ -1050,6 +1089,7 @@ mod tests {
             },
             notify: None,
             logs: LogConfig::default(),
+            sessions: SessionConfig::default(),
             prompts: vec![
                 PromptStep {
                     id: "plan".to_owned(),

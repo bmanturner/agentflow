@@ -295,8 +295,6 @@ async fn drive_flow(request: DriveRequest<'_>) -> Result<()> {
         .items
         .get(request.start_item_index)
         .ok_or_else(|| anyhow!("resume item index is out of range"))?;
-    let persist_session =
-        session_persistence_enabled(request.config, request.resume_session.as_deref());
     let mut rpc = OmpRpc::start(
         request.omp,
         request.repo_root,
@@ -304,7 +302,6 @@ async fn drive_flow(request: DriveRequest<'_>) -> Result<()> {
         &socket_path,
         &first_item.item_id,
         first_item.counter,
-        persist_session,
     )
     .await?;
 
@@ -429,8 +426,6 @@ async fn drive_flow_inner(
 ) -> Result<DriveEnd> {
     let mut session: Option<SessionInfo> = None;
     let mut force_new_session = request.resume_session.is_some() && request.start_prompt_index == 0;
-    let persist_session =
-        session_persistence_enabled(request.config, request.resume_session.as_deref());
     let collect_frames = request.config.logs.enabled;
     if request.resume_session.is_some() {
         let item = request
@@ -531,32 +526,23 @@ async fn drive_flow_inner(
                 .await;
             }
 
-            let need_new_session = force_new_session
-                || (prompt.new_session && (session.is_some() || !persist_session));
+            let need_new_session = force_new_session || (prompt.new_session && session.is_some());
             if need_new_session {
-                if persist_session {
-                    let (new_session, frames) = rpc.new_session_with_frames(collect_frames).await?;
-                    append_rpc_frames(request.config, request.paths, &item.item_id, &frames)
-                        .await?;
-                    if request.config.logs.enabled {
-                        record_session_info(
-                            request.paths,
-                            item,
-                            prompt.id.as_str(),
-                            &new_session,
-                            "new_session",
-                        )
-                        .await?;
-                    }
-                    session = Some(new_session);
-                } else {
-                    let frames = rpc.new_session_without_state(collect_frames).await?;
-                    append_rpc_frames(request.config, request.paths, &item.item_id, &frames)
-                        .await?;
-                    session = None;
+                let (new_session, frames) = rpc.new_session_with_frames(collect_frames).await?;
+                append_rpc_frames(request.config, request.paths, &item.item_id, &frames).await?;
+                if request.config.logs.enabled {
+                    record_session_info(
+                        request.paths,
+                        item,
+                        prompt.id.as_str(),
+                        &new_session,
+                        "new_session",
+                    )
+                    .await?;
                 }
+                session = Some(new_session);
                 force_new_session = false;
-            } else if session.is_none() && persist_session {
+            } else if session.is_none() {
                 let (initial_session, frames) = rpc.get_state_with_frames(collect_frames).await?;
                 append_rpc_frames(request.config, request.paths, &item.item_id, &frames).await?;
                 if request.config.logs.enabled {
@@ -944,9 +930,6 @@ where
     }
     Ok(())
 }
-fn session_persistence_enabled(config: &Config, resume_session: Option<&Path>) -> bool {
-    resume_session.is_some() || config.sessions.enabled
-}
 
 async fn append_rpc_frame(
     config: &Config,
@@ -1073,7 +1056,7 @@ fn sanitize_run_id(run_id: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::config::{Config, LogConfig, LoopConfig, PromptStep, Provider, SessionConfig};
+    use crate::config::{Config, LogConfig, LoopConfig, PromptStep, Provider};
 
     use super::*;
 
@@ -1089,7 +1072,6 @@ mod tests {
             },
             notify: None,
             logs: LogConfig::default(),
-            sessions: SessionConfig::default(),
             prompts: vec![
                 PromptStep {
                     id: "plan".to_owned(),

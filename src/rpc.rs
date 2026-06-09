@@ -119,7 +119,6 @@ impl OmpRpc {
         control_socket: impl AsRef<Path>,
         item_id: &str,
         counter: i64,
-        persist_session: bool,
     ) -> Result<Self> {
         let timeouts = RpcTimeouts::from_env()?;
 
@@ -138,8 +137,6 @@ impl OmpRpc {
 
         if let Some(session) = resume_session {
             command.arg("--resume").arg(session);
-        } else if should_disable_omp_session(resume_session, persist_session) {
-            command.arg("--no-session");
         }
 
         let mut child = command.spawn().context("failed to start omp rpc process")?;
@@ -402,16 +399,6 @@ impl OmpRpc {
         Ok((current, frames))
     }
 
-    pub async fn new_session_without_state(&mut self, collect_frames: bool) -> Result<Vec<Value>> {
-        let (response, mut frames) = self
-            .command(json!({ "type": "new_session" }), collect_frames)
-            .await?;
-        if collect_frames {
-            frames.push(response);
-        }
-        Ok(frames)
-    }
-
     pub async fn switch_session(&mut self, session_path: &Path) -> Result<SessionInfo> {
         let session_path_text = session_path.to_string_lossy();
         let _ = self
@@ -647,10 +634,6 @@ fn is_retryable_busy_error(error: &str) -> bool {
     error.contains("already processing") || error.contains("Already processing")
 }
 
-fn should_disable_omp_session(resume_session: Option<&Path>, persist_session: bool) -> bool {
-    resume_session.is_none() && !persist_session
-}
-
 fn retry_deadline(duration: Duration) -> Instant {
     Instant::now() + duration
 }
@@ -796,16 +779,6 @@ mod tests {
         assert_eq!(retry_delay(1), Duration::from_secs(2));
         assert_eq!(retry_delay(4), Duration::from_secs(15));
         assert_eq!(retry_delay(10), Duration::from_secs(15));
-    }
-
-    #[test]
-    fn should_disable_omp_session_only_without_resume_or_persistence() {
-        assert!(should_disable_omp_session(None, false));
-        assert!(!should_disable_omp_session(None, true));
-        assert!(!should_disable_omp_session(
-            Some(Path::new("/tmp/session.jsonl")),
-            false
-        ));
     }
 
     #[test]

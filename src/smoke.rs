@@ -6,7 +6,7 @@ use crate::rpc::OmpRpc;
 
 pub async fn run_smoke_test(omp: &str, repo_root: &Path) -> Result<()> {
     let socket = std::env::temp_dir().join("agentflow-smoke-test.sock");
-    let mut rpc = OmpRpc::start(omp, repo_root, None, &socket, "SMOKE", 0, true).await?;
+    let mut rpc = OmpRpc::start(omp, repo_root, None, &socket, "SMOKE", 0).await?;
 
     let initial = rpc.get_state().await?;
     let token = "AGENTFLOW_SMOKE_TEST";
